@@ -1,12 +1,13 @@
 /**
  * A tiny, dependency-free line-editing model for the prompt input.
  *
- * The renderer owns the terminal; this module owns the *text* — a single
- * logical line plus a caret position — and exposes pure transforms for the
- * common readline-style edits (insert, delete, word/line kill, cursor moves)
- * and a {@link visibleLine} helper that windows a long line around the caret
- * so it stays on screen. Keeping it pure makes the editing rules trivial to
- * unit test without a TTY.
+ * The renderer owns the terminal; this module owns the *text* — buffer plus
+ * caret position, where the buffer may carry embedded newlines — and exposes
+ * pure transforms for the common readline-style edits (insert, delete,
+ * word/line kill, cursor moves), a {@link visibleLine} helper that windows a
+ * long line around the caret, and {@link layoutPromptInput} which folds a
+ * multi-line buffer into visual rows. Keeping it pure makes the editing rules
+ * trivial to unit test without a TTY.
  */
 
 import type { TerminalKey } from "./stream-format.js";
@@ -163,6 +164,64 @@ export function visibleLine(state: LineState, budget: number, ellipsis = "…"):
   }
 
   return { before: visible.slice(0, rel), after: visible.slice(rel) };
+}
+
+/** One visual row of a laid-out prompt: its raw text and the buffer index of its first column. */
+export interface PromptVisualRow {
+  readonly text: string;
+  readonly start: number;
+}
+
+/**
+ * A multi-line prompt buffer laid out into visual rows, with the caret located
+ * in that grid. `caretRow` indexes {@link rows}; `caretCol` is the column within
+ * that row (0..row.text.length).
+ */
+export interface PromptLayout {
+  readonly rows: PromptVisualRow[];
+  readonly caretRow: number;
+  readonly caretCol: number;
+}
+
+/**
+ * Lays a prompt buffer out into visual rows of at most `width` columns: embedded
+ * newlines start a new row and longer logical lines wrap. Pure geometry — no
+ * styling — so the renderer and up/down navigation share one source of truth for
+ * the cursor ↔ row/column mapping.
+ */
+export function layoutPromptInput(state: LineState, width: number): PromptLayout {
+  const cols = Math.max(1, width);
+  const rows: PromptVisualRow[] = [];
+  let caretRow = 0;
+  let caretCol = 0;
+
+  const lines = state.text.split("\n");
+  let lineStart = 0;
+  for (const line of lines) {
+    let consumed = 0;
+    // An empty logical line still occupies one row; a non-empty one wraps into
+    // ceil(length / cols) rows.
+    do {
+      const chunk = line.slice(consumed, consumed + cols);
+      const chunkStart = lineStart + consumed;
+      const isLastChunk = consumed + cols >= line.length;
+      // The caret belongs to this chunk when it sits inside it; the chunk that
+      // ends a logical line also owns the caret at its trailing edge.
+      if (
+        state.cursor >= chunkStart &&
+        (state.cursor < chunkStart + chunk.length ||
+          (isLastChunk && state.cursor <= chunkStart + chunk.length))
+      ) {
+        caretRow = rows.length;
+        caretCol = state.cursor - chunkStart;
+      }
+      rows.push({ text: chunk, start: chunkStart });
+      consumed += cols;
+    } while (consumed < line.length);
+    lineStart += line.length + 1; // + 1 for the "\n" that split removed
+  }
+
+  return { rows, caretRow, caretCol };
 }
 
 /**

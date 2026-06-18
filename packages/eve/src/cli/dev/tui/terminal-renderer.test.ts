@@ -256,6 +256,37 @@ describe("TerminalRenderer (inline scrollback)", () => {
     renderer.shutdown();
   });
 
+  it("renders a pasted multi-line buffer across separate rows, no glyph", async () => {
+    const { screen, input, renderer } = makeRenderer();
+
+    const prompt = renderer.readPrompt();
+    input.send("\x1b[200~first line\nsecond line\x1b[201~");
+
+    const lines = screen.snapshot().split("\n");
+    const firstRow = lines.findIndex((line) => line.includes("first line"));
+    const secondRow = lines.findIndex((line) => line.includes("second line"));
+    expect(firstRow).toBeGreaterThanOrEqual(0);
+    expect(secondRow).toBe(firstRow + 1);
+    expect(screen.snapshot()).not.toContain("⏎");
+
+    input.enter();
+    await prompt;
+    renderer.shutdown();
+  });
+
+  it("moves the caret into the line above on ↑, then edits it", async () => {
+    const { input, renderer } = makeRenderer();
+
+    const prompt = renderer.readPrompt();
+    input.send("\x1b[200~ab\ncd\x1b[201~"); // caret lands after "cd"
+    input.up(); // to the end of "ab"
+    input.type("X");
+    input.enter();
+
+    expect(await prompt).toBe("abX\ncd");
+    renderer.shutdown();
+  });
+
   it("renders reused stream block ids across separate prompt turns", async () => {
     const { screen, renderer } = makeRenderer();
 

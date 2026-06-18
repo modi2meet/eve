@@ -9,6 +9,7 @@ import {
   insert,
   killToEnd,
   killToStart,
+  layoutPromptInput,
   lineOf,
   moveEnd,
   moveHome,
@@ -138,5 +139,60 @@ describe("PromptHistory", () => {
     history.begin("");
     expect(history.previous("")).toBe("hello");
     expect(history.previous("hello")).toBeUndefined();
+  });
+});
+
+describe("layoutPromptInput", () => {
+  it("keeps a short single line as one row with the caret in place", () => {
+    const layout = layoutPromptInput({ text: "hello", cursor: 2 }, 80);
+    expect(layout.rows).toEqual([{ text: "hello", start: 0 }]);
+    expect({ caretRow: layout.caretRow, caretCol: layout.caretCol }).toEqual({
+      caretRow: 0,
+      caretCol: 2,
+    });
+  });
+
+  it("breaks on embedded newlines, one row per logical line", () => {
+    const layout = layoutPromptInput({ text: "ab\ncd", cursor: 4 }, 80);
+    expect(layout.rows).toEqual([
+      { text: "ab", start: 0 },
+      { text: "cd", start: 3 },
+    ]);
+    // cursor 4 is the "d": second row (start 3), column 1.
+    expect({ caretRow: layout.caretRow, caretCol: layout.caretCol }).toEqual({
+      caretRow: 1,
+      caretCol: 1,
+    });
+  });
+
+  it("places the caret at the end of a line when it sits on the newline", () => {
+    const layout = layoutPromptInput({ text: "ab\ncd", cursor: 2 }, 80);
+    expect({ caretRow: layout.caretRow, caretCol: layout.caretCol }).toEqual({
+      caretRow: 0,
+      caretCol: 2,
+    });
+  });
+
+  it("keeps blank lines as their own row", () => {
+    const layout = layoutPromptInput({ text: "a\n\nb", cursor: 3 }, 80);
+    expect(layout.rows).toEqual([
+      { text: "a", start: 0 },
+      { text: "", start: 2 },
+      { text: "b", start: 3 },
+    ]);
+    expect(layout.caretRow).toBe(2);
+  });
+
+  it("wraps a long logical line at the column width", () => {
+    const layout = layoutPromptInput({ text: "abcdefgh", cursor: 5 }, 4);
+    expect(layout.rows).toEqual([
+      { text: "abcd", start: 0 },
+      { text: "efgh", start: 4 },
+    ]);
+    // cursor 5 is inside the second chunk (start 4), column 1.
+    expect({ caretRow: layout.caretRow, caretCol: layout.caretCol }).toEqual({
+      caretRow: 1,
+      caretCol: 1,
+    });
   });
 });

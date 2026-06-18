@@ -74,8 +74,8 @@ import {
   PromptHistory,
   applyLineEditorKey,
   deleteForward,
+  layoutPromptInput,
   lineOf,
-  visibleLine,
   type LineState,
 } from "./line-editor.js";
 import { LiveRegion } from "./live-region.js";
@@ -220,6 +220,9 @@ const escFlushMs = 30;
 // How long the transient Ctrl+L log-mode hint stays in the status line after
 // the last cycle before it clears itself.
 const logLevelHintMs = 5_000;
+// Cap on the prompt input's visible height; a taller multi-line buffer scrolls
+// internally so it can't push the rest of the TUI off-screen.
+const PROMPT_MAX_ROWS = 10;
 
 const STATUS = {
   processing: "Working…",
@@ -461,22 +464,28 @@ export class TerminalRenderer implements AgentTUIRenderer {
         switch (key.type) {
           case "up": {
             const open = suggestions();
-            if (open === undefined) {
-              recall(this.#promptHistory.previous(editor.text));
-            } else {
+            if (open !== undefined) {
               this.#typeahead = moveTypeaheadSelection(open, -1);
               this.#paint();
+              break;
             }
+            // Within a multi-line buffer, ↑ walks to the row above; only at the
+            // top row does it hand off to prompt history.
+            const moved = this.#caretToRow(editor, "up");
+            if (moved !== undefined) apply(moved);
+            else recall(this.#promptHistory.previous(editor.text));
             break;
           }
           case "down": {
             const open = suggestions();
-            if (open === undefined) {
-              recall(this.#promptHistory.next());
-            } else {
+            if (open !== undefined) {
               this.#typeahead = moveTypeaheadSelection(open, 1);
               this.#paint();
+              break;
             }
+            const moved = this.#caretToRow(editor, "down");
+            if (moved !== undefined) apply(moved);
+            else recall(this.#promptHistory.next());
             break;
           }
           case "tab": {
@@ -554,6 +563,21 @@ export class TerminalRenderer implements AgentTUIRenderer {
   #syncInput(state: LineState): void {
     this.#inputText = state.text;
     this.#inputCursor = state.cursor;
+  }
+
+  /**
+   * Moves the caret to the visual row above or below its current one, keeping
+   * the column where it can. Returns `undefined` when there is no such row (the
+   * caret is on the first/last row), so the caller can fall back to history.
+   * Uses the same layout the renderer paints, so navigation tracks wrapping.
+   */
+  #caretToRow(state: LineState, direction: "up" | "down"): LineState | undefined {
+    const contentWidth = Math.max(1, this.#width() - 3);
+    const layout = layoutPromptInput(state, contentWidth);
+    const targetRow = direction === "up" ? layout.caretRow - 1 : layout.caretRow + 1;
+    if (targetRow < 0 || targetRow >= layout.rows.length) return undefined;
+    const row = layout.rows[targetRow]!;
+    return { text: state.text, cursor: row.start + Math.min(layout.caretCol, row.text.length) };
   }
 
   async renderStream(
@@ -2353,29 +2377,55 @@ export class TerminalRenderer implements AgentTUIRenderer {
       ) {
         rows.push(...renderCommandSuggestions(this.#typeahead, this.#theme, width));
       }
-      // Reserve three columns: prompt glyph, its trailing space, and the caret.
-      const budget = Math.max(4, width - 3);
-      const { before, after } = visibleLine(
-        { text: this.#inputText, cursor: this.#inputCursor },
-        budget,
-        this.#theme.glyph.ellipsis,
-      );
       // A fully typed known command paints blue, confirming it will dispatch
       // as a command instead of being sent to the agent as a message.
       const isCommand = isPromptControlCommand(this.#inputText);
       const style = (segment: string): string =>
         isCommand && segment.length > 0 ? c.blue(segment) : segment;
-      const caret = this.#caretVisible ? c.cyan(this.#theme.glyph.caret) : " ";
       const ghost = inlineHint ? c.dim(` ${inlineHint}`) : "";
-      // A pasted multi-line prompt keeps its real newlines in the buffer (and on
-      // submit); show each as a dim glyph so this single input row never emits a
-      // literal newline into the live region.
-      const showNewlines = (segment: string): string =>
-        segment.includes("\n")
-          ? segment.replaceAll("\n", c.dim(this.#theme.glyph.newline))
-          : segment;
-      const body = `${style(showNewlines(before))}${caret}${style(showNewlines(after))}${ghost}`;
-      rows.push(...promptInputRows(body, width, this.#theme, true));
+
+      // The buffer can carry newlines (paste, or Shift+Enter later); lay it out
+      // across visual rows so the prompt grows downward instead of collapsing
+      // onto one line. Reserve three columns: the gutter glyph, its trailing
+      // space, and room for the caret at the end of a row.
+      const contentWidth = Math.max(1, width - 3);
+      const layout = layoutPromptInput(
+        { text: this.#inputText, cursor: this.#inputCursor },
+        contentWidth,
+      );
+
+      // Cap the input viewport and scroll it to keep the caret visible, so a
+      // tall paste can't push the rest of the TUI off-screen.
+      const total = layout.rows.length;
+      const visibleCount = Math.min(PROMPT_MAX_ROWS, total);
+      let top = 0;
+      if (layout.caretRow >= visibleCount) top = layout.caretRow - visibleCount + 1;
+      top = Math.min(top, total - visibleCount);
+
+      const promptGlyph = c.cyan(this.#theme.glyph.prompt);
+      const ellipsis = c.dim(this.#theme.glyph.ellipsis);
+      for (let r = top; r < top + visibleCount; r += 1) {
+        const row = layout.rows[r]!;
+        // Gutter: the prompt glyph on the true first row, a scroll marker when
+        // rows are hidden above or below the viewport, otherwise blank for
+        // alignment under the prompt.
+        let gutter = " ";
+        if (r === top && top > 0) gutter = ellipsis;
+        else if (r === top + visibleCount - 1 && top + visibleCount < total) gutter = ellipsis;
+        else if (r === 0) gutter = promptGlyph;
+
+        let body: string;
+        if (r === layout.caretRow) {
+          const caret = this.#caretVisible ? c.cyan(this.#theme.glyph.caret) : " ";
+          body = `${style(row.text.slice(0, layout.caretCol))}${caret}${style(row.text.slice(layout.caretCol))}`;
+        } else {
+          body = style(row.text);
+        }
+        // The argument hint trails the caret only on a single-line command draft.
+        if (ghost.length > 0 && total === 1 && r === layout.caretRow) body += ghost;
+        rows.push(clip(`${gutter} ${body}`, width));
+      }
+      rows.push("");
       this.#pushStatusLine(rows, width);
       return rows;
     }
@@ -2711,18 +2761,6 @@ async function* iterateTUIStream(
 
 function clip(line: string, width: number): string {
   return visibleLength(line) > width ? sliceVisible(line, width) : line;
-}
-
-/**
- * Renders the original prompt glyph and horizontal position, followed by a
- * blank row that keeps the persistent status visually separate. During a
- * turn the same row stays visible but dimmed beneath live activity.
- */
-function promptInputRows(content: string, width: number, theme: Theme, active: boolean): string[] {
-  const c = theme.colors;
-  const prompt = active ? c.cyan(theme.glyph.prompt) : c.dim(theme.glyph.prompt);
-  const body = active ? content : c.dim(content);
-  return [clip(`${prompt} ${body}`, width), ""];
 }
 
 /** Kind + title of the previously rendered block, for gap / run decisions. */
